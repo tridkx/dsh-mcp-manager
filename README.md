@@ -1,5 +1,11 @@
 # dsh-mcp-manager
 
+> [!WARNING]
+> **AI 生成声明 / AI-Generated Notice**
+> 本项目（代码与文档）由 AI 辅助生成，仅供个人学习、参考与二次开发使用。
+> 请在使用前自行审查代码的安全性，作者不对使用本项目造成的任何后果负责。
+> This project (code & docs) was AI-assisted. Use at your own risk; review before use.
+
 > **English summary** — A self-developed DeepSeek Harness (DSH) Web plugin that
 > visually manages MCP (Model Context Protocol) servers from the settings page,
 > bridges server tools to the model as `mcp__<server>__<tool>`, and splits the
