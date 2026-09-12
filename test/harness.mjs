@@ -132,6 +132,14 @@ export function makeSpawn() {
   };
 }
 
+let homeSeq = 0;
+/**
+ * Fresh temp DSH home. The sequence suffix matters: two homes created in the
+ * same millisecond would otherwise collide, and a REUSED home carries the
+ * previous run's tools.json/notice.txt into the next test, which silently
+ * feeds a mock server the wrong tool list.
+ */
 export function tmpHome(tag) {
-  return path.join(os.tmpdir(), 'mcp-manager-test-' + tag + '-' + Date.now());
+  homeSeq += 1;
+  return path.join(os.tmpdir(), 'mcp-manager-test-' + tag + '-' + process.pid + '-' + Date.now() + '-' + homeSeq);
 }

@@ -225,6 +225,41 @@ healthTool 不在工具列表  → 'unknown'
 
 `health` op 让 GUI「体检」按钮随时重跑探针。
 
+### 4.9 工具代际：构建 → 校验 → 原子替换（v1.2.0）
+
+"代际"= 一台服务器的一次完整工具列表快照。版本更新时**整代换或整代不换**，绝不出现半新半旧。
+
+**为什么需要**：v1.1.0 及更早是「先 `unregisterTools` 全部注销，再逐个 `register` 并各自 catch」。中途任何异常都会留下**残缺的一批**——模型看到 3 个工具，服务器其实有 28 个，而且没有报错。
+
+`swapToolsGeneration(entry, ownsRecord)` 的顺序：
+
+1. **内部查重**：同一份列表里出现重复的公开名 → 整批拒绝（重复项会让 `findTool` 永远只命中第一个）。
+2. **归档构建**：`buildMcpTool` 全部构建完毕——一切可能抛错的事都发生在动线上代际**之前**。
+3. **替换**：先 `unregisterTools(旧代)`，再逐个注册新代。
+4. **回滚**：若新代注册中途抛错，丢弃已注册的新项，用 `entry.generator()` 重建上一代；重建也失败才留空，并把实情写进 `generation.problems`。
+
+> **第 3 步的顺序是踩坑换来的**：最初写成"先注册新代、成功后再注销旧代"（更符合直觉的原子交换），结果工具注册表**按公开名做键**，两代重叠时同名工具互相覆盖，随后旧代的 disposer 又把刚注册的新条目删掉——实测把 `[alpha]` 换代成 `[alpha, beta]` 后注册表里**只剩 beta**，而代际记录还声称有 2 个工具。所以顺序必须是"先拆后建"，配合第 2 步的预构建保证不会空窗失败。回归测试见 `test/generation.mjs` 的 D 段。
+
+**重同步（`notifications/tools/list_changed`）**：
+
+```
+resyncing=true → 拉列表
+   拉取失败 → generation.status='keeping'，上一代继续注册且可调用
+   拉取成功 → 换代码际；期间若又收到通知，则再拉一次再换（队列化，不交错）
+```
+
+`generation` 记录随 `status`/`tools` 暴露给 GUI 与 `mcp_manager`：
+
+| status | 含义 |
+|---|---|
+| `empty` | 还没有过任何工具列表 |
+| `applied` | 这一代是当前生效的 |
+| `queued` | 本次发布被在飞的重同步接管（会由那一轮发布） |
+| `rejected` | 新快照校验/构建/注册失败，**上一代仍在用** |
+| `keeping` | 重同步拉取失败，**上一代仍在用** |
+
+> 跨服务器撞名在结构上不可能：公开名是 `mcp__<serverName>__<rawName>`，命名空间自带服务器名。远程工具名里内嵌别家前缀也逃不出自己的命名空间（`test/generation.mjs` B 段验证）。因此跨代冲突检测保留为**防御性**检查，正常配置下不会触发。
+
 ---
 
 ## 5. 客户端实现细节（lib/client.js）
@@ -361,6 +396,8 @@ GUI "+ 新增服务器" 或 `mcp_manager add`（HTTP：`url` 必填；stdio：`c
 | 14 | 截图对视觉模型无用 | ≤v1.1.0 把所有非文本块压成 `[image]` | v1.2.0 的 `contentBlocksOf` + `saveImageBlocks` 经 attachments 落库后投影为真实 image 块（§4.7） |
 | 16 | 手搓 `{type:'image', source:{…}}` 会炸整个请求 | 装配器无条件读 `block.attachment.bytes` | 图片必须走 attachments 服务，禁止自造 image 块形状（§4.7） |
 | 17 | staging 块泄漏到装配器 | `saveImageBlocks` 筛 `'image'`，而 staging 标记是 `'__mcpImage'`，筛选为空 → 整段短路 | 筛选条件与 staging 标记必须一致；测试须断言"无 attachments 时不得出现 image 块" |
+| 18 | 换代后同名工具消失 | 工具注册表**按公开名做键**；先注册新代再注销旧代时，两代同名条目互相覆盖，旧代 disposer 删掉了新条目（`[alpha]`→`[alpha,beta]` 只剩 `beta`） | 原子替换必须是**先拆后建**，且新代已在第 2 步全部预构建好（§4.9） |
+| 19 | 测试假绿：mock 一直返回旧列表 | `tmpHome` 用 `Date.now()` 命名，同毫秒内复用目录，残留的 `tools.json` 被下一轮 mock 读到 | 临时目录名加进程号+序号（见 `test/harness.mjs`） |
 | 15 | 测试台把待测环境变量吃掉了 | harness 里把 `process.env` 与 `spec.env` 合并，覆盖了配置里的 `BLENDER_PORT`，导致"后端不可达"用例实际连到真实后端，测试假绿 | 宿主把**完整子环境**交给 spawn：harness 必须直接用 `spec.env`，不要再 merge `process.env` |
 
 ---

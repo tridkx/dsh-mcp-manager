@@ -20,9 +20,10 @@
 | **模型工具桥接（按需注入）** | 默认 lazy 模式：连接成功后**不**把工具 schema 塞进每个请求，模型通过 `mcp_tools` 网关按需 `list` / `describe` / `call`；切到 `eager` 才注册成 `mcp__<服务器名>__<工具名>`（如 `mcp__godot-ai__editor_state`）。另有管理工具 `mcp_manager` |
 | **按需环境说明（notes）** | 每台服务器可写一段 `notes`（如「Blender 不在 PATH」「9877 端口约定」「侧边栏显示 bug」）。它**不进每个请求**，只在模型 `describe` 该服务器某个工具时随附——这就是把环境知识从 `AGENTS.md` 搬出来的位置 |
 | **健康探针** | 握手成功 ≠ 后端可用。配置 `healthTool` + `healthExpect` 后，连接时真调一次探针并校验返回内容，GUI 据此区分「已连接（后端正常）」与「服务不可用」 |
+| **整代原子替换** | 服务器改工具列表（`tools/list_changed`）时整批校验、整批替换：重复名、构建失败、注册失败一律**保留上一代**，绝不留下"半个服务器"；失败原因在 GUI 上直接可见 |
 | **插件分类页签** | 在 设置 → 插件 提供"官方插件"与"自定义插件"两个独立页签，替代官方平面"插件列表" |
 
-版本：**1.2.0**（v1.2.0 新增 lazy 按需注入 + `mcp_tools` 网关、服务器 `notes` 按需说明、健康探针与诚实的连接状态；v1.1.0 修复「编辑页改名实为报错+删除」问题）。
+版本：**1.2.1**（v1.2.1 工具列表改为**整代原子替换**：重复名/异常一律整批拒绝并保留上一代，修掉换代时同名工具被旧代 disposer 删掉的 bug；v1.2.0 新增 lazy 按需注入 + `mcp_tools` 网关、服务器 `notes` 按需说明、健康探针与诚实的连接状态；v1.1.0 修复「编辑页改名实为报错+删除」问题）。
 许可：MIT。
 
 ---
@@ -116,6 +117,8 @@ dsh-mcp-manager/
 ├── test/
 │   ├── harness.mjs     # 假 ctx（effect/timeout/fs/settings/subprocess/tools），用于离线跑宿主插件
 │   ├── e2e.mjs         # 对真实 MCP 服务器跑端到端断言（模式、网关、notes、图片、探针）
+│   ├── generation.mjs  # 工具代际原子替换（畸形列表 → 整批拒绝 + 保留上一代）
+│   ├── mock-mcp.mjs    # 可注入畸形工具列表的极简 MCP 服务器
 │   └── measure.mjs     # 量 lazy vs eager 的每请求工具负载
 ├── docs/
 │   └── TECHNICAL.md    # 技术文档：架构、实现细节、维护与拓展指南
@@ -127,10 +130,12 @@ dsh-mcp-manager/
 ```bash
 # 任意一个 blender-mcp 可执行文件即可（uv 缓存里有）
 node test/e2e.mjs  /path/to/blender-mcp.exe   # 端到端（含"后端不可达"方向；Blender 开着时额外覆盖 healthy + 截图）
+node test/generation.mjs                      # 工具代际原子替换（自带 mock MCP 服务器，会注入畸形列表）
 node test/measure.mjs /path/to/blender-mcp.exe # 打印每请求字符数对比
 ```
 
 `e2e.mjs` 会故意指向一个死端口来验证探针能识破"握手成功但后端不可用"，因此**不需要**先关掉 Blender。
+`generation.mjs` 用 `test/mock-mcp.mjs` 伪造重复工具名等真实服务器不会产生的畸形列表，验证"整批拒绝 + 保留上一代"。
 
 ---
 
