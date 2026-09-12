@@ -17,10 +17,12 @@
 | 能力 | 说明 |
 |---|---|
 | **MCP 服务器管理** | 在 设置 → "MCP 管理" 可视化增删改（含改名）MCP 服务器配置（stdio 子进程 / streamable-HTTP 两种传输），连接/断开、浏览工具、调用测试 |
-| **模型工具桥接** | 连接成功后把服务器的 MCP 工具注册成模型可直接调用的工具：`mcp__<服务器名>__<工具名>`（如 `mcp__godot-ai__editor_state`）；另有管理工具 `mcp_manager` 供 Agent 在对话中直接管理 |
+| **模型工具桥接（按需注入）** | 默认 lazy 模式：连接成功后**不**把工具 schema 塞进每个请求，模型通过 `mcp_tools` 网关按需 `list` / `describe` / `call`；切到 `eager` 才注册成 `mcp__<服务器名>__<工具名>`（如 `mcp__godot-ai__editor_state`）。另有管理工具 `mcp_manager` |
+| **按需环境说明（notes）** | 每台服务器可写一段 `notes`（如「Blender 不在 PATH」「9877 端口约定」「侧边栏显示 bug」）。它**不进每个请求**，只在模型 `describe` 该服务器某个工具时随附——这就是把环境知识从 `AGENTS.md` 搬出来的位置 |
+| **健康探针** | 握手成功 ≠ 后端可用。配置 `healthTool` + `healthExpect` 后，连接时真调一次探针并校验返回内容，GUI 据此区分「已连接（后端正常）」与「服务不可用」 |
 | **插件分类页签** | 在 设置 → 插件 提供"官方插件"与"自定义插件"两个独立页签，替代官方平面"插件列表" |
 
-版本：**1.1.0**（v1.1.0 修复「编辑页改名实为报错+删除」问题，宿主支持原子改名）。
+版本：**1.2.0**（v1.2.0 新增 lazy 按需注入 + `mcp_tools` 网关、服务器 `notes` 按需说明、健康探针与诚实的连接状态；v1.1.0 修复「编辑页改名实为报错+删除」问题）。
 许可：MIT。
 
 ---
@@ -62,10 +64,31 @@
 
 保存后配置落盘 `$DSH_HOME/.dsh-mcp-servers.json`，重启后自动重连。
 
-### 使用桥接工具
+### 使用桥接工具（两种模式）
 
-连接成功的服务器，其工具自动以 `mcp__<服务器名>__<工具名>` 注册给模型。
-例如 `mcp__godot-ai__editor_state`，参数即服务器下发的 `inputSchema`。
+**默认 lazy：按需注入。** 服务器的工具**不会**出现在模型工具列表里，取而代之的是一个稳定网关 `mcp_tools`：
+
+| 调用 | 作用 |
+|---|---|
+| `mcp_tools({action:"list"})` | 列出各服务器的工具名 + 一句话描述 + 载入状态，**不含 schema** |
+| `mcp_tools({action:"describe", tool:"get_scene_info"})` | 载入该工具的完整参数 schema **以及该服务器的 `notes`** |
+| `mcp_tools({action:"call", tool:"…", arguments:{…}, server:"…"})` | 直接调用（`server` 仅在工具重名时需要） |
+| `mcp_tools({action:"load", server:"blender"})` | 把该服务器整体提升为常驻注册（回到 lazy 需重载插件） |
+
+为什么这样设计：MCP 工具的 schema 会进入**每一次**请求。实测一台 blender-mcp（28 个工具）在 eager 模式下每请求多带 **28,219 字符**（约 8k–11k tokens），而 lazy 模式的网关只有 **841 字符** —— **降幅 87%**；需要某个工具时再花约 1,100 字符 `describe` 一次。
+
+**eager（旧行为）：** 服务器工具以 `mcp__<服务器名>__<工具名>` 直接注册，例如 `mcp__godot-ai__editor_state`，参数即服务器下发的 `inputSchema`。适合工具少、调用频繁的服务器。
+
+图片结果（如 Blender 的 `get_viewport_screenshot`）在两种模式下都会以**原生图片块**返回给支持视觉的模型；不支持时投影为 `[图片: image/png]` 之类的文本说明。
+
+### 健康探针：为什么「已连接」可能骗人
+
+MCP 的 `initialize` 握手成功只证明**桥接进程**活着。`uvx blender-mcp` 在 Blender 没启动时照样握手成功，甚至把后端故障当**成功结果**返回（`isError:false`，错误文本在正文里）。所以：
+
+- 未配置 `healthTool`：GUI 显示「已连接（未校验后端）」—— 不谎报可用。
+- 配置了 `healthTool` + `healthExpect`：连接后真调一次探针，返回正文里必须出现 `healthExpect` 才算健康；否则标红「服务不可用（后端未响应）」并附原因。
+
+blender 服务器的推荐值：`healthTool: get_addon_status`、`healthArguments: {"user_prompt":"health probe"}`、`healthExpect: "protocol_version"`。
 
 ### mcp_manager 工具
 
@@ -76,6 +99,7 @@ Agent 可直接管理服务器的全部操作：
 | `list` / `status` | 列出所有服务器及连接状态 |
 | `add` / `update` / `remove` | 增删改配置（改名为 `update` + `originalName` 旧名 + `name` 新名） |
 | `connect` / `disconnect` | 建立/断开连接 |
+| `health` | 立即跑一次健康探针并返回结果 |
 | `tools` | 查看某服务器发现的工具 |
 | `call` | 直接调用某服务器的一个工具 |
 
@@ -87,12 +111,26 @@ Agent 可直接管理服务器的全部操作：
 dsh-mcp-manager/
 ├── package.json        # 包声明：main = 宿主入口；exports["./client"] = 浏览器 bundle
 ├── lib/
-│   ├── index.js        # 宿主插件（ESM，零 import）—— MCP 客户端、工具桥接、GUI RPC
+│   ├── index.js        # 宿主插件（ESM，零 import）—— MCP 客户端、工具桥接、按需网关、GUI RPC
 │   └── client.js       # 浏览器端 bundle（设置页 UI + 插件分类页签）
+├── test/
+│   ├── harness.mjs     # 假 ctx（effect/timeout/fs/settings/subprocess/tools），用于离线跑宿主插件
+│   ├── e2e.mjs         # 对真实 MCP 服务器跑端到端断言（模式、网关、notes、图片、探针）
+│   └── measure.mjs     # 量 lazy vs eager 的每请求工具负载
 ├── docs/
 │   └── TECHNICAL.md    # 技术文档：架构、实现细节、维护与拓展指南
 └── README.md           # 本文件
 ```
+
+### 跑测试
+
+```bash
+# 任意一个 blender-mcp 可执行文件即可（uv 缓存里有）
+node test/e2e.mjs  /path/to/blender-mcp.exe   # 端到端（含"后端不可达"方向；Blender 开着时额外覆盖 healthy + 截图）
+node test/measure.mjs /path/to/blender-mcp.exe # 打印每请求字符数对比
+```
+
+`e2e.mjs` 会故意指向一个死端口来验证探针能识破"握手成功但后端不可用"，因此**不需要**先关掉 Blender。
 
 ---
 

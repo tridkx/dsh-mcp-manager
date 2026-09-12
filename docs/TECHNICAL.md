@@ -10,7 +10,7 @@
 > that registers the settings section and the official/custom plugin tabs.
 
 本文档面向后续维护者（人或 AI Agent），描述本插件的架构、实现细节、维护与拓展方法。
-最后更新：2026-08-15（对应 v1.1.0）。
+最后更新：2026-09-12（对应 v1.2.0）。
 
 ---
 
@@ -47,7 +47,8 @@
 ┌──────────────────────────── Host (Node) ─────────────────────────────┐
 │  lib/index.js（零 import 的 ESM Cordis 插件）                          │
 │    ├─ webServer 路由  /mcp-manager/api  （GUI 的 JSON RPC）           │
-│    ├─ ctx.tools.register → mcp_manager + mcp__<server>__<tool>       │
+│    ├─ ctx.tools.register → mcp_manager + mcp_tools（lazy 网关）       │
+│    │                          + mcp__<server>__<tool>（仅 eager 模式）│
 │    ├─ subprocess 服务：stdio 传输（spawn 子进程）                      │
 │    ├─ subprocess + curl：HTTP 传输（streamable-http + SSE 解析）      │
 │    └─ 配置读写：$DSH_HOME/.dsh-mcp-servers.json                       │
@@ -153,6 +154,65 @@ POST JSON `{ op, ...payload }` → `runOp()` 分发（list/add/update/remove/con
 - `apply` 末尾读配置 → `ctx.timeout(500ms)` 后**自动连接所有已保存服务器**（best-effort，失败仅记 error）。
 - 所有 disposer（路由、工具、子进程清理）都包在 `ctx.effect()` 里，插件卸载时自动回收。
 
+### 4.6 三种注入模式与 `mcp_tools` 网关（v1.2.0）
+
+每台服务器有 `mode`：
+
+| mode | 注册到模型的东西 | 每请求成本 |
+|---|---|---|
+| `lazy`（默认） | 无直连工具；靠常驻的 `mcp_tools` 网关 | 网关约 841 字符（与服务器工具数无关） |
+| `eager` | 全部 `mcp__<server>__<tool>` | 全部 schema 之和（实测 blender 28 工具 ≈ 28,219 字符） |
+| `off` | 无 | 0 |
+
+**为什么必须按需**：MCP 工具的 description + inputSchema 会进入**每一次**请求。28 个工具的 blender-mcp 在 eager 下每请求多带 28k 字符，而模型一次只用一两个工具。这与 skill 的渐进披露是同一种取舍。
+
+**网关实现要点**（`gatewayTool` / `runGateway`）：
+
+- `list` → `catalogText()`：服务器分组 + 工具名 + 描述截断到 `DESC_MAX`(140) + `已载入/未载入` 标记 + 健康状态；总量超 `CATALOG_MAX`(6000) 截断。
+- `describe` → `describeText()`：`sanitizeSchema(inputSchema)` 的 JSON + **该服务器 `notes`**（截断 `NOTES_MAX`=8000）；并把工具名记入 `entry.loaded`，供 `list` 反馈。
+- `call` → `gatewayCall()`：结果经 `contentBlocksOf()` 投影为 ContentBlock[]，**保留原生 image 块**（见 4.7）。
+- `load` → 把 `entry.config.mode` 改成 `eager` 并落盘；**不可逆**（要回 lazy 得重载插件），所以网关描述里明说了这一点。
+- 工具名解析：不传 `server` 时，**恰好一个**已连接服务器提供该名才接受；否则报错并列出候选，绝不猜。
+
+**扩展指引**：加新 action 只需在 `runGateway` 加分支 + 在 `gatewayTool.parameters.properties.action.enum` 登记；`registerTools()` 是唯一决定"注册什么"的地方，新 mode 在那里分支。
+
+### 4.7 结果投影与图片（v1.2.0）
+
+`contentBlocksOf(result)` 把 MCP `content[]` 反投影为 DSH `ContentBlock[]`：
+
+| MCP 块 | 投影 |
+|---|---|
+| `{type:"text"}` | `{type:"text"}` 原样 |
+| `{type:"image", mimeType, data}` | `{type:"image", source:{type:"base64", media_type, data}}` —— 需模型声明图片输入才真正生效 |
+| 媒体类型不支持 / base64 非法 / 超 4 MiB | 降级为文本诊断，**不静默丢弃** |
+| `{type:"audio"}` / `{type:"resource"}` | `[audio]` / `[resource]` 文本 |
+
+> 旧版（≤v1.1.0）把所有非文本块压成 `[image]`，于是 `get_viewport_screenshot` 对视觉模型毫无用处。
+>
+> 对照：官方 `@deepseek-ai/dsh-mcp-client` 的图片桥接更完整——它把图片存进 `attachments` 服务（`saveImages`）并先验证模型 `inputModalities`。本插件直接内联 base64，省一个服务依赖，代价是没有持久化与容量治理。**若图片在实机上不显示，第一步就是把 `blocks` 交给模型路由验证，然后改用 attachments 路径。**
+
+### 4.8 健康探针（v1.2.0）
+
+`probeHealth(entry)` 在每次连接成功/重同步后运行：
+
+```
+healthTool 未配置        → health.status = 'unchecked'   （GUI 显示"未校验后端"，不谎报）
+healthTool 不在工具列表  → 'unknown'
+调用 healthTool（预算 min(15s, toolCallTimeoutMs/4)）
+  isError 为真                          → 'degraded'
+  正文不含 healthExpect                 → 'degraded'  ← 关键：见下
+  否则                                  → 'healthy'
+```
+
+**为什么必须有 `healthExpect`**：`uvx blender-mcp` 把后端故障当**成功**返回——Blender 未启动时 `get_addon_status` 返回 `isError:false`，正文是 `Error checking addon status: Could not connect to Blender.…`。只判 `isError` 会得出"健康"的错误结论。实测对照（同一服务器，只改 `BLENDER_PORT`）：
+
+```
+[PORT 9999] get_addon_status  isError=False  Error checking addon status: Could not connect to Blender…
+[PORT 9877] get_addon_status  isError=False  { "up_to_date": true, "protocol_version": 5, … }
+```
+
+`health` op 让 GUI「体检」按钮随时重跑探针。
+
 ---
 
 ## 5. 客户端实现细节（lib/client.js）
@@ -226,14 +286,19 @@ const isOfficial = (e) => e.moduleName.startsWith('@deepseek-ai/') || e.moduleNa
 1. **插件没加载**：重启后 `Tool.listTools` 无 `mcp_manager` → 检查 `cordis.patch.yml` 行名与包目录名一致、
    `node --check lib/*.js` 语法、包能否从 profile 解析
    （`require.resolve('@dsh-user/dsh-mcp-manager/package.json', { paths: [profileDir] })`）。
-2. **工具没注册**：服务器连接失败（GUI 红字）；或 `registerTools` 逐个 catch 吞错（宿主日志见
-   `failed to register mcp__...`）。FastMCP schema 根 `additionalProperties:false` 在**手工注册通道无限制**；
+2. **工具没注册**：先看模式——`lazy`/`off` 下**本来就没有** `mcp__*` 直连工具，模型要用 `mcp_tools`；
+   只有 `eager` 才逐个注册。eager 下若缺失，看 GUI 红字或宿主日志 `failed to register mcp__...`
+   （`registerTools` 逐个 catch 吞错）。FastMCP schema 根 `additionalProperties:false` 在**手工注册通道无限制**；
    若以后改回 `defineTool` 通道，须先置根 `additionalProperties:true`。
 3. **HTTP 连不上**：先 `curl` 直连验证服务器存活；检查是否缺 `-i`/双 Accept（见 §4.3）；
    检查 `Mcp-Session-Id` 是否透传。
 4. **GUI 没显示页签**：检查 `exports["./client"]` 路径、bundle 的 `id` 与行模块名一致、
    `dsh.client` 声明合法；浏览器控制台看模块加载错误。
 5. **重启后丢失**：确认包在 profile（而非 npx 缓存）下；`~/.dsh/.dsh-mcp-servers.json` 存在。
+6. **GUI 显示"已连接"但工具全失败**（v1.2.0 之前的经典误报）：`state` 只反映 MCP 握手。
+   配置 `healthTool` + `healthExpect` 后 UI 会显示真实后端状态；没配则显示"未校验后端"。
+7. **`mcp_tools` 报没有该工具**：工具名是**服务器原始名**（如 `get_scene_info`），不是 `mcp__blender__get_scene_info`；
+   重名工具需显式传 `server`。
 
 ---
 
@@ -279,6 +344,10 @@ GUI "+ 新增服务器" 或 `mcp_manager add`（HTTP：`url` 必填；stdio：`c
 | 9 | 客户端 bundle 语法错 | 手写括号易错（箭头函数不占额外括号） | `node --check` 先行 + 分段提取自检 |
 | 10 | `exports` 缺 `./package.json` | client-modules 用 `require.resolve('<pkg>/package.json')` | exports 里补 `"./package.json": "./package.json"` |
 | 11 | 编辑页改名实为"报错+删除" | 旧客户端先 `update(新名)` 再 `remove(旧名)`；宿主 `updateServer` 按新名查不到 → 抛 "server not found"，随后旧条目被删 | v1.1.0：宿主支持 `originalName`（旧名）+ `name`（新名）单次原子改名；客户端仅发一次 `update`，不再补 `remove` |
+| 12 | GUI 显示"已连接"，工具全失败 | `state` 只表示 MCP 握手成功；stdio 服务器（`uvx blender-mcp`）在 Blender 关闭时也握手成功；桌面端还有"把后端错误当成功返回"的行为 | v1.2.0：`healthTool` + `healthExpect` 探针 + 未配置时显示"未校验后端"（§4.8） |
+| 13 | 只判 `isError` 的探针误报健康 | blender-mcp 后端不可达时 `get_addon_status` 返回 `isError:false`，错误只在正文 | 探针必须校验正文内容（`healthExpect`），不能只信协议层的 `isError` |
+| 14 | 截图对视觉模型无用 | ≤v1.1.0 把所有非文本块压成 `[image]` | v1.2.0 的 `contentBlocksOf` 保留原生 image 块（§4.7） |
+| 15 | 测试台把待测环境变量吃掉了 | harness 里把 `process.env` 与 `spec.env` 合并，覆盖了配置里的 `BLENDER_PORT`，导致"后端不可达"用例实际连到真实后端，测试假绿 | 宿主把**完整子环境**交给 spawn：harness 必须直接用 `spec.env`，不要再 merge `process.env` |
 
 ---
 
