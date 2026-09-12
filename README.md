@@ -79,7 +79,7 @@
 
 **eager（旧行为）：** 服务器工具以 `mcp__<服务器名>__<工具名>` 直接注册，例如 `mcp__godot-ai__editor_state`，参数即服务器下发的 `inputSchema`。适合工具少、调用频繁的服务器。
 
-图片结果（如 Blender 的 `get_viewport_screenshot`）在两种模式下都会以**原生图片块**返回给支持视觉的模型；不支持时投影为 `[图片: image/png]` 之类的文本说明。
+图片结果（如 Blender 的 `get_viewport_screenshot`）在两种模式下都会经 `attachments` 服务落库后以**真实图片块**返回给声明了图片输入的模型；模型不支持图片、或没有 `attachments` 服务、或图片非法/过大时，投影为 `[image unavailable: image/png; …]` 这类带原因的文本，**不会静默丢失，也不会把整个请求搞崩**。
 
 ### 健康探针：为什么「已连接」可能骗人
 

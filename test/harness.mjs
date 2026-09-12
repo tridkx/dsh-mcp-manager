@@ -12,12 +12,38 @@ export function makeCtx(opts = {}) {
   const disposers = [];
   const timers = [];
 
+  const savedImages = [];
   const ctx = {
     registered,
     registrations,
     disposers,
+    savedImages,
     get(name) {
       if (name === 'sandboxPolicy') return { workspaceRoot: opts.workspaceRoot || process.cwd() };
+      if (name === 'attachments' && opts.attachments) {
+        return {
+          // Mirrors the real contract: authoritative validation, durable refs,
+          // `bytes` taken from the stored bytes.
+          async saveImages(inputs) {
+            return inputs.map((input) => {
+              if (!input.data || !input.data.length) throw new Error('empty image bytes');
+              if (!String(input.mediaType || '').startsWith('image/')) throw new Error('unsupported media type: ' + input.mediaType);
+              savedImages.push(input);
+              return {
+                attachmentId: 'att_' + savedImages.length,
+                mediaType: input.mediaType,
+                bytes: input.data.length,
+                width: 640,
+                height: 480,
+                name: input.name,
+              };
+            });
+          },
+        };
+      }
+      if (name === 'llm' && opts.attachments) {
+        return { async resolveModelInfo() { return { inputModalities: opts.modalities || ['text', 'image'] }; } };
+      }
       return undefined;
     },
     effect(fn, label) {

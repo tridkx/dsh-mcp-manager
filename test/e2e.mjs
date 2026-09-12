@@ -135,13 +135,41 @@ if (live) {
   // The human-readable receipt is `shot.text` (the same string the UI/model
   // sees); it is not a separate text BLOCK when the result is image-only.
   const txt = shot.text || '';
-  if (imgs.length) {
-    ok(true, '★ 截图以原生 image 块返回（旧版只有 "[image]" 占位）');
-    ok(imgs[0].source && imgs[0].source.type === 'base64' && imgs[0].source.media_type === 'image/png', 'image 块形状正确', imgs[0].source && { type: imgs[0].source.type, media_type: imgs[0].source.media_type, dataLength: (imgs[0].source.data || '').length });
-    ok(/\[图片: image\/png\]/.test(txt), '文本回执里保留图片位置说明', txt);
-  } else {
-    ok(/image unavailable|Error executing/.test(txt), '截图非图片或失败时给出明确诊断（不静默）', txt.slice(0, 200));
-  }
+  // No attachment store is mounted on this ctx, so the only SAFE outcome is a
+  // text diagnostic: the request assembler reads `block.attachment.bytes`
+  // unconditionally, so a hand-made image block would fail the whole request.
+  ok(imgs.length === 0, '★ 无 attachments 服务时不产出 image 块（否则装配器抛错，整请求失败）', imgs.map((b) => Object.keys(b)));
+  ok(/\[image unavailable: image\/png; .+\]/.test(txt), '★ 图片降级为明确诊断文本（不静默丢失）', txt.slice(0, 220));
+}
+
+// ── part D: with an attachment store + vision route, images become real blocks ─
+if (live) {
+  console.log('\n=== D. 挂载 attachments + llm 后，截图应成为真实 ImageBlock ===');
+  const homeD = tmpHome('attach');
+  await fsp.mkdir(homeD, { recursive: true });
+  await fsp.writeFile(path.join(homeD, '.dsh-mcp-servers.json'), JSON.stringify([baseServer(LIVE_PORT)], null, 2), 'utf8');
+  const ctxD = makeCtx({ dshHome: homeD, spawn: makeSpawn(), attachments: true });
+  await (await import('../lib/index.js')).apply(ctxD);
+  await waitFor(async () => (await status(ctxD)).state === 'connected', 60000, 'connect (D)');
+  const execD = { agent: { options: { provider: 'opencode-go', model: 'deepseek-flash' }, session: { requestHeader: () => ({ config: { provider: 'opencode-go', model: 'deepseek-flash' } }) } } };
+  const shotD = await gw(ctxD).execute({ action: 'call', tool: 'get_viewport_screenshot', arguments: { max_size: 300, user_prompt: 'e2e: screenshot for admission' } }, execD);
+  const imgsD = shotD.blocks.filter((b) => b.type === 'image');
+  ok(imgsD.length === 1, '★ 截图投影为 1 个真实 image 块', shotD.blocks.map((b) => b.type));
+  const ref = imgsD[0] && imgsD[0].attachment;
+  ok(ref && typeof ref.attachmentId === 'string' && typeof ref.bytes === 'number' && ref.bytes > 1000,
+    '★ image 块带 attachment 引用（装配器所需形状）', ref);
+  ok(!imgsD[0].source, '不再使用非法的 source 形状', imgsD[0] && Object.keys(imgsD[0]));
+  ok(ctxD.savedImages.length === 1, '图片确实经 attachments.saveImages 落库', ctxD.savedImages.length);
+  ok(/\[图片: image\/png\]/.test(shotD.text), '文本回执保留图片位置说明', shotD.text);
+
+  // a text-only route must degrade instead of shipping an unusable image
+  const ctxE = makeCtx({ dshHome: homeD, spawn: makeSpawn(), attachments: true, modalities: ['text'] });
+  await (await import('../lib/index.js')).apply(ctxE);
+  await waitFor(async () => (await status(ctxE)).state === 'connected', 60000, 'connect (E)');
+  const execE = { agent: { options: { provider: 'p', model: 'text-only' }, session: { requestHeader: () => ({ config: { provider: 'p', model: 'text-only' } }) } } };
+  const shotE = await gw(ctxE).execute({ action: 'call', tool: 'get_viewport_screenshot', arguments: { max_size: 300, user_prompt: 'e2e: text-only route' } }, execE);
+  ok(shotE.blocks.every((b) => b.type !== 'image'), '纯文本模型下不产出 image 块', shotE.blocks.map((b) => b.type));
+  ok(/does not declare image input/.test(shotE.text), '并说明原因', shotE.text.slice(0, 200));
 }
 
 console.log('\n' + (fail === 0 ? '★ 全部通过' : '✗ ' + fail + ' 项失败') + '：' + pass + ' passed, ' + fail + ' failed');

@@ -178,18 +178,30 @@ POST JSON `{ op, ...payload }` → `runOp()` 分发（list/add/update/remove/con
 
 ### 4.7 结果投影与图片（v1.2.0）
 
-`contentBlocksOf(result)` 把 MCP `content[]` 反投影为 DSH `ContentBlock[]`：
+`contentBlocksOf(result)` 把 MCP `content[]` 反投影为 DSH `ContentBlock[]`，分两步：
 
-| MCP 块 | 投影 |
+**第一步（同步）**：文本原样；图片先放进**私有 staging 形状** `{type:'__mcpImage', __mime, __data, __name}`；
+不支持的媒体类型 / 空数据直接降级为文本诊断。
+
+**第二步 `saveImageBlocks()`（异步，必须）**：
+
+| 情况 | 结果 |
 |---|---|
-| `{type:"text"}` | `{type:"text"}` 原样 |
-| `{type:"image", mimeType, data}` | `{type:"image", source:{type:"base64", media_type, data}}` —— 需模型声明图片输入才真正生效 |
-| 媒体类型不支持 / base64 非法 / 超 4 MiB | 降级为文本诊断，**不静默丢弃** |
-| `{type:"audio"}` / `{type:"resource"}` | `[audio]` / `[resource]` 文本 |
+| 模型路由声明图片输入 + `attachments` 服务在场 | `attachments.saveImages([...])` → `{type:'image', attachment: ImageAttachmentRef}` |
+| 无 `attachments` 服务 | 降级为 `[image unavailable: …; no attachment store is mounted]` |
+| 路由无法解析（无 exec/agent/llm） | 降级，说明原因 |
+| 模型未声明图片输入 | 降级为「does not declare image input」 |
+| base64 非规范 / 超 8 MiB / 存储拒绝 | 降级并附原因 |
 
+> **为什么不能直接塞 base64**：DSH 的 `ImageBlock` 是 `{type:'image', attachment: ImageAttachmentRef}`，
+> 请求装配器（`dsh-llm`）在 `collectImageLengths` / `replaceImagesForTextModel` 里**无条件**读
+> `block.attachment.bytes`。手搓 `{type:'image', source:{…}}` 会让**整个请求**抛错，而不只是图片丢失。
+> 图片只能经 `attachments` 服务落库后以引用形式进入请求——这也是官方 `dsh-mcp-client` 的做法。
+>
 > 旧版（≤v1.1.0）把所有非文本块压成 `[image]`，于是 `get_viewport_screenshot` 对视觉模型毫无用处。
 >
-> 对照：官方 `@deepseek-ai/dsh-mcp-client` 的图片桥接更完整——它把图片存进 `attachments` 服务（`saveImages`）并先验证模型 `inputModalities`。本插件直接内联 base64，省一个服务依赖，代价是没有持久化与容量治理。**若图片在实机上不显示，第一步就是把 `blocks` 交给模型路由验证，然后改用 attachments 路径。**
+> 注意 staging 块的类型标记是 `'__mcpImage'`——`saveImageBlocks` 的筛选必须匹配它（曾因写成 `'image'` 导致
+> 筛选为空、逻辑整段短路、staging 块原样泄漏给装配器）。
 
 ### 4.8 健康探针（v1.2.0）
 
@@ -346,7 +358,9 @@ GUI "+ 新增服务器" 或 `mcp_manager add`（HTTP：`url` 必填；stdio：`c
 | 11 | 编辑页改名实为"报错+删除" | 旧客户端先 `update(新名)` 再 `remove(旧名)`；宿主 `updateServer` 按新名查不到 → 抛 "server not found"，随后旧条目被删 | v1.1.0：宿主支持 `originalName`（旧名）+ `name`（新名）单次原子改名；客户端仅发一次 `update`，不再补 `remove` |
 | 12 | GUI 显示"已连接"，工具全失败 | `state` 只表示 MCP 握手成功；stdio 服务器（`uvx blender-mcp`）在 Blender 关闭时也握手成功；桌面端还有"把后端错误当成功返回"的行为 | v1.2.0：`healthTool` + `healthExpect` 探针 + 未配置时显示"未校验后端"（§4.8） |
 | 13 | 只判 `isError` 的探针误报健康 | blender-mcp 后端不可达时 `get_addon_status` 返回 `isError:false`，错误只在正文 | 探针必须校验正文内容（`healthExpect`），不能只信协议层的 `isError` |
-| 14 | 截图对视觉模型无用 | ≤v1.1.0 把所有非文本块压成 `[image]` | v1.2.0 的 `contentBlocksOf` 保留原生 image 块（§4.7） |
+| 14 | 截图对视觉模型无用 | ≤v1.1.0 把所有非文本块压成 `[image]` | v1.2.0 的 `contentBlocksOf` + `saveImageBlocks` 经 attachments 落库后投影为真实 image 块（§4.7） |
+| 16 | 手搓 `{type:'image', source:{…}}` 会炸整个请求 | 装配器无条件读 `block.attachment.bytes` | 图片必须走 attachments 服务，禁止自造 image 块形状（§4.7） |
+| 17 | staging 块泄漏到装配器 | `saveImageBlocks` 筛 `'image'`，而 staging 标记是 `'__mcpImage'`，筛选为空 → 整段短路 | 筛选条件与 staging 标记必须一致；测试须断言"无 attachments 时不得出现 image 块" |
 | 15 | 测试台把待测环境变量吃掉了 | harness 里把 `process.env` 与 `spec.env` 合并，覆盖了配置里的 `BLENDER_PORT`，导致"后端不可达"用例实际连到真实后端，测试假绿 | 宿主把**完整子环境**交给 spawn：harness 必须直接用 `spec.env`，不要再 merge `process.env` |
 
 ---
