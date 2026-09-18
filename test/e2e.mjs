@@ -105,7 +105,13 @@ const loadedA = await gw(ctxA).execute({ action: 'load', server: 'blender' });
 ok(loadedA.mode === 'eager', 'load 切到 eager');
 ok(directNames(ctxA).length === stA.tools.length, 'load 后全部工具直连注册', directNames(ctxA).length + '/' + stA.tools.length);
 const persistedA = JSON.parse(await fsp.readFile(path.join(homeA, '.dsh-mcp-servers.json'), 'utf8'));
-ok(persistedA[0].mode === 'eager' && persistedA[0].notes === NOTES, 'mode/notes 已落盘');
+// `load` is deliberately in-memory only (v1.2.2): the promotion must NOT be
+// written to disk, or reloading the plugin could never restore lazy mode —
+// which is exactly what the gateway description and README promise. The file
+// therefore still holds the mode it was booted with.
+ok(persistedA[0].mode === 'lazy', '★ load 不落盘：磁盘仍是 lazy（重载即恢复按需）', persistedA[0].mode);
+ok(loadedA.persisted === false, '★ load 明确报告未持久化', loadedA.persisted);
+ok(persistedA[0].notes === NOTES, 'notes 保持落盘且未被 load 波及');
 
 console.log('\n=== B. off 模式 ===');
 const homeB = tmpHome('off');

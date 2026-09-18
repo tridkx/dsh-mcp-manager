@@ -23,7 +23,7 @@
 | **整代原子替换** | 服务器改工具列表（`tools/list_changed`）时整批校验、整批替换：重复名、构建失败、注册失败一律**保留上一代**，绝不留下"半个服务器"；失败原因在 GUI 上直接可见 |
 | **插件分类页签** | 在 设置 → 插件 提供"官方插件"与"自定义插件"两个独立页签，替代官方平面"插件列表" |
 
-版本：**1.2.1**（v1.2.1 工具列表改为**整代原子替换**：重复名/异常一律整批拒绝并保留上一代，修掉换代时同名工具被旧代 disposer 删掉的 bug；v1.2.0 新增 lazy 按需注入 + `mcp_tools` 网关、服务器 `notes` 按需说明、健康探针与诚实的连接状态；v1.1.0 修复「编辑页改名实为报错+删除」问题）。
+版本：**1.2.2**（v1.2.2 修两处：①**子进程清理改为等待**——`terminate()` 返回的清理 promise 过去被丢弃，插件重载/dsh 重启时异步收尾跑不完，`cmd.exe → uvx → MCP 服务器` 会变成孤儿进程；②`mcp_tools load` 改为**只作用于当前进程**，不再把 `eager` 写进配置，重载插件即回到 lazy，与网关描述和本文档一致。新增 `test/lifecycle.mjs` 回归；v1.2.1 工具列表改为**整代原子替换**：重复名/异常一律整批拒绝并保留上一代，修掉换代时同名工具被旧代 disposer 删掉的 bug；v1.2.0 新增 lazy 按需注入 + `mcp_tools` 网关、服务器 `notes` 按需说明、健康探针与诚实的连接状态；v1.1.0 修复「编辑页改名实为报错+删除」问题）。
 许可：MIT。
 
 ---
@@ -74,7 +74,7 @@
 | `mcp_tools({action:"list"})` | 列出各服务器的工具名 + 一句话描述 + 载入状态，**不含 schema** |
 | `mcp_tools({action:"describe", tool:"get_scene_info"})` | 载入该工具的完整参数 schema **以及该服务器的 `notes`** |
 | `mcp_tools({action:"call", tool:"…", arguments:{…}, server:"…"})` | 直接调用（`server` 仅在工具重名时需要） |
-| `mcp_tools({action:"load", server:"blender"})` | 把该服务器整体提升为常驻注册（回到 lazy 需重载插件） |
+| `mcp_tools({action:"load", server:"blender"})` | 把该服务器整体提升为常驻注册。**只作用于当前进程、不写盘**：重载插件或重启 dsh 后自动回到配置里的 lazy；要永久常驻请在配置里把注入方式设为 eager |
 
 为什么这样设计：MCP 工具的 schema 会进入**每一次**请求。实测一台 blender-mcp（28 个工具）在 eager 模式下每请求多带 **28,219 字符**（约 8k–11k tokens），而 lazy 模式的网关只有 **841 字符** —— **降幅 87%**；需要某个工具时再花约 1,100 字符 `describe` 一次。
 
@@ -131,11 +131,13 @@ dsh-mcp-manager/
 # 任意一个 blender-mcp 可执行文件即可（uv 缓存里有）
 node test/e2e.mjs  /path/to/blender-mcp.exe   # 端到端（含"后端不可达"方向；Blender 开着时额外覆盖 healthy + 截图）
 node test/generation.mjs                      # 工具代际原子替换（自带 mock MCP 服务器，会注入畸形列表）
+node test/lifecycle.mjs                       # 卸载等待异步 terminate + load 只改内存（自带 mock，无需参数）
 node test/measure.mjs /path/to/blender-mcp.exe # 打印每请求字符数对比
 ```
 
 `e2e.mjs` 会故意指向一个死端口来验证探针能识破"握手成功但后端不可用"，因此**不需要**先关掉 Blender。
 `generation.mjs` 用 `test/mock-mcp.mjs` 伪造重复工具名等真实服务器不会产生的畸形列表，验证"整批拒绝 + 保留上一代"。
+`lifecycle.mjs` 的 spawn seam 会让 `terminate()` 返回一个**延迟 400ms 才兑现**的 promise——这正是"清理是异步的"这一事实的可观测形式，所以它能区分"真的 wait 了"和"只是调了一下"。
 
 ---
 

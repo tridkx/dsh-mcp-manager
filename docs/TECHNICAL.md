@@ -153,6 +153,7 @@ POST JSON `{ op, ...payload }` → `runOp()` 分发（list/add/update/remove/con
 
 - `apply` 末尾读配置 → `ctx.timeout(500ms)` 后**自动连接所有已保存服务器**（best-effort，失败仅记 error）。
 - 所有 disposer（路由、工具、子进程清理）都包在 `ctx.effect()` 里，插件卸载时自动回收。
+- **子进程清理必须 await（v1.2.2）**：subprocess seam 的 `terminate()` 是**异步**的（POSIX 上分阶段 SIGTERM→SIGKILL，Windows 上 `TerminateJobObject` 后轮询 Job 直到静默），其 `void` 返回类型只表示"清理流程已启动"。早期实现把它当同步调用、丢弃返回的 promise，于是插件重载或 dsh 重启时清理函数立刻返回，而 `cmd.exe → uvx → MCP 服务器` 这条链还在收尾——进程变成孤儿残留。现在 `teardownConnection()` 捕获并 `await` 该 promise（外加 8s 兜底超时，防止卡死的 handle 拖住卸载），`disconnect` 也 await 它；卸载 effect 返回 `Promise.all(...)`，而 Cordis 的 `_unload()` 确实 `await runDisposable(dispose)`，所以"卸载完成"现在真的等于"没有子进程活过它"。回归测试见 `test/lifecycle.mjs` 的 A 段（用一个终止延迟 400ms 的 spawn seam 反向验证：去掉 await 后该段立刻变红）。
 
 ### 4.6 三种注入模式与 `mcp_tools` 网关（v1.2.0）
 
@@ -166,12 +167,14 @@ POST JSON `{ op, ...payload }` → `runOp()` 分发（list/add/update/remove/con
 
 **为什么必须按需**：MCP 工具的 description + inputSchema 会进入**每一次**请求。28 个工具的 blender-mcp 在 eager 下每请求多带 28k 字符，而模型一次只用一两个工具。这与 skill 的渐进披露是同一种取舍。
 
+**两个 mode 字段（v1.2.2）**：`entry.config.mode` 是**运行时**模式，`entry.persistedMode` 是**磁盘上**的模式；只有 `mcp_tools load` 会让二者分离（它只提升前者）。`saveServers()` 一律序列化 `persistedMode`，因此任何一次落盘——哪怕来自完全无关的改动——都不会把临时提升固化下来。显式配置路径（`update`）会同时刷新二者。
+
 **网关实现要点**（`gatewayTool` / `runGateway`）：
 
 - `list` → `catalogText()`：服务器分组 + 工具名 + 描述截断到 `DESC_MAX`(140) + `已载入/未载入` 标记 + 健康状态；总量超 `CATALOG_MAX`(6000) 截断。
 - `describe` → `describeText()`：`sanitizeSchema(inputSchema)` 的 JSON + **该服务器 `notes`**（截断 `NOTES_MAX`=8000）；并把工具名记入 `entry.loaded`，供 `list` 反馈。
 - `call` → `gatewayCall()`：结果经 `contentBlocksOf()` 投影为 ContentBlock[]，**保留原生 image 块**（见 4.7）。
-- `load` → 把 `entry.config.mode` 改成 `eager` 并落盘；**不可逆**（要回 lazy 得重载插件），所以网关描述里明说了这一点。
+- `load` → 把 `entry.config.mode` 改成 `eager`，**只改内存**；落盘用的模式另存在 `entry.persistedMode`，`saveServers()` 序列化时取它，所以重载插件/重启 dsh 后自然回到配置里的 lazy。想**永久**常驻必须走配置（GUI 的「工具注入方式」或 `mcp_manager update`），那条路径会刷新 `persistedMode` 再落盘。
 - 工具名解析：不传 `server` 时，**恰好一个**已连接服务器提供该名才接受；否则报错并列出候选，绝不猜。
 
 **扩展指引**：加新 action 只需在 `runGateway` 加分支 + 在 `gatewayTool.parameters.properties.action.enum` 登记；`registerTools()` 是唯一决定"注册什么"的地方，新 mode 在那里分支。
