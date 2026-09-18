@@ -98,17 +98,26 @@ function makeAsyncTerminateSpawn(trace) {
   };
 }
 
-const NOTES = '回归测试用 notes：只应在 describe 时出现。';
+const NOTES = [
+  '本机 Blender 环境（回归测试用多行 notes）。',
+  '',
+  '可执行文件不在 PATH 里：`D:\\Blender Foundation\\Blender 5.2\\blender.exe`',
+  '启动命令（路径含空格，必须加引号）：',
+  '- Git Bash：`"/d/Blender Foundation/Blender 5.2/blender.exe" &`',
+  '- PowerShell：`& "D:\\Blender Foundation\\Blender 5.2\\blender.exe"`',
+  '',
+  '不要去找 blender.exe、不要怀疑安装路径。',
+].join('\n');
 const server = () => ({
   name: 'blender', transport: 'stdio', command: NODE, args: [MOCK, 'ok'],
   env: {}, cwd: '', url: '', headers: {}, toolCallTimeoutMs: 20000,
   mode: 'lazy', notes: NOTES,
 });
 
-async function boot(home, servers, spawn) {
+async function boot(home, servers, spawn, opts = {}) {
   await fsp.mkdir(home, { recursive: true });
   await fsp.writeFile(path.join(home, '.dsh-mcp-servers.json'), JSON.stringify(servers, null, 2), 'utf8');
-  const ctx = makeCtx({ dshHome: home, spawn });
+  const ctx = makeCtx(Object.assign({ dshHome: home, spawn }, opts));
   const plugin = await import('../lib/index.js');
   await plugin.apply(ctx);
   return ctx;
@@ -181,6 +190,83 @@ const explicit = JSON.parse(await fsp.readFile(path.join(homeB, '.dsh-mcp-server
 ok(explicit.mode === 'eager', '★ 显式配置的 eager 仍然正常落盘（永久路径未被破坏）', explicit.mode);
 
 await unload(ctxB);
+
+// ── C. notes must survive describe with their structure intact ──────────────
+// `brief()` collapses every whitespace run, which is right for a one-line tool
+// description and destructive for multi-line environment notes: a 51-line
+// primer used to arrive as a single unreadable line.
+console.log('\n=== C. describe 保留 notes 的多行结构 ===');
+const homeC = tmpHome('notes-shape');
+const ctxC = await boot(homeC, [server()], makeAsyncTerminateSpawn({ pid: null, calls: 0, killedAt: 0 }));
+const apiC = ctxC.registered.get('mcp_manager');
+const gwC = ctxC.registered.get('mcp_tools');
+await waitConnected(apiC, 'connect (C)');
+
+const catC = await gwC.execute({ action: 'list' });
+ok(catC.text.includes('✎有环境说明'),
+  '★ 目录标明该服务器有 notes（否则模型无从知道值得 describe）', catC.text.slice(0, 160));
+
+const descC = await gwC.execute({ action: 'describe', tool: 'alpha' });
+const body = descC.text.slice(descC.text.indexOf('本机 Blender 环境'));
+ok(body.includes('blender.exe'),
+  'notes 里的关键环境事实确实进入了 describe 输出');
+ok(body.includes('\n'),
+  '★ notes 保留了换行（未被压成单行）', { newlines: (body.match(/\n/g) || []).length });
+ok(body.includes('\n\n'),
+  '★ notes 保留了空行/段落结构');
+ok(descC.text.includes('✎有环境说明') === false ||
+   descC.text.indexOf('✎有环境说明') < descC.text.indexOf('本机 Blender 环境'),
+  '目录标记没有混进 describe 正文');
+
+await unload(ctxC);
+
+// ── D. first-screen prompt section (discoverability) ───────────────────────
+// Tools alone are not discoverability: without a prompt section the model never
+// learns the servers exist, never calls describe, and so never sees `notes` —
+// which is what made MCP look unconfigured in real sessions.
+console.log('\n=== D. 首屏提示词注入 ===');
+const homeD = tmpHome('prompt-section');
+const ctxD = await boot(homeD, [server()], makeAsyncTerminateSpawn({ pid: null, calls: 0, killedAt: 0 }));
+ok(ctxD.systemPrompt.sections.length === 1,
+  '★ 插件注册了 system prompt section', ctxD.systemPrompt.sections.map((s) => s.name));
+const rendered = ctxD.systemPrompt.render();
+ok(rendered.includes('blender'),
+  '★ 首屏就点名了 MCP 服务器（模型无需先试探）', rendered.slice(0, 200));
+ok(rendered.includes('Blender Foundation') || rendered.includes('blender.exe') || rendered.includes('本机 Blender'),
+  '★ 首屏带上了 notes 摘要行（关键环境事实的第一手线索）', rendered.slice(0, 240));
+ok(rendered.includes('mcp_tools'),
+  '★ 首屏告知用 mcp_tools 取工具与完整说明');
+ok(!rendered.includes('不要去找 blender.exe、不要怀疑安装路径'),
+  '★ 完整 notes 仍留在 describe（首屏只给摘要，未破坏两级注入）');
+ok(rendered.includes('不在') && rendered.includes('工具列表'),
+  '★ 首屏明确说明这些工具不在工具列表里（模型最容易搞错的一点）');
+ok(rendered.includes('action:"list"') || rendered.includes('list'),
+  '★ 首屏给出取用路径');
+ok(rendered.length <= 700, '首屏注入有总量上限（不违反 lazy 成本原则）', rendered.length);
+
+// Multi-server budget: one verbose summary must not truncate another server
+// out of the section entirely.
+const homeD2 = tmpHome('prompt-multi');
+const verbose = Object.assign(server(), { name: 'alpha', notes: 'A'.repeat(400) + '\n第二行不该出现' });
+const second = Object.assign(server(), { name: 'beta', notes: 'BETA 服务器：关键事实在第一行。' });
+const ctxD2 = await boot(homeD2, [verbose, second], makeAsyncTerminateSpawn({ pid: null, calls: 0, killedAt: 0 }));
+const multi = ctxD2.systemPrompt.render();
+ok(multi.includes('alpha') && multi.includes('beta'),
+  '★ 多服务器时每台都被列出（严苛的首行不会挤掉别人）', multi.slice(0, 220));
+ok(!multi.includes('第二行不该出现'), '首行摘要不会把 notes 整段拖进首屏');
+await unload(ctxD2);
+console.log('  ── 实际注入文本 ──');
+console.log(rendered.split('\n').map((l) => '  │ ' + l).join('\n'));
+await unload(ctxD);
+
+// ── E. absent systemPrompt must degrade, not break ─────────────────────────
+console.log('\n=== E. 无 systemPrompt 服务时降级 ===');
+const homeE = tmpHome('no-prompt');
+const ctxE = await boot(homeE, [server()], makeAsyncTerminateSpawn({ pid: null, calls: 0, killedAt: 0 }), { systemPrompt: false });
+ok(ctxE.registered.has('mcp_tools') && ctxE.registered.has('mcp_manager'),
+  '★ 缺 systemPrompt 时工具桥接仍正常（提示词是增强，不是硬依赖）');
+await waitConnected(ctxE.registered.get('mcp_manager'), 'connect (E)');
+await unload(ctxE);
 
 console.log('\n' + (fail === 0 ? '✅ 全部通过' : '❌ 有失败') + '  ' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail === 0 ? 0 : 1);

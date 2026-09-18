@@ -13,13 +13,27 @@ export function makeCtx(opts = {}) {
   const timers = [];
 
   const savedImages = [];
+  // Minimal system-prompt seam: records sections and can render them, which is
+  // what the first-screen injection test asserts on.
+  const systemPrompt = {
+    sections: [],
+    section(s) { this.sections.push(s); return () => {}; },
+    render() {
+      return this.sections
+        .map((s) => (typeof s.text === 'function' ? s.text() : s.text))
+        .filter((t) => typeof t === 'string' && t.length)
+        .join('\n\n');
+    },
+  };
   const ctx = {
     registered,
     registrations,
     disposers,
     savedImages,
+    systemPrompt,
     get(name) {
       if (name === 'sandboxPolicy') return { workspaceRoot: opts.workspaceRoot || process.cwd() };
+      if (name === 'systemPrompt') return opts.systemPrompt === false ? undefined : systemPrompt;
       if (name === 'attachments' && opts.attachments) {
         return {
           // Mirrors the real contract: authoritative validation, durable refs,
@@ -80,6 +94,7 @@ export function makeCtx(opts = {}) {
         return () => { registered.delete(def.name); };
       },
     },
+    // `systemPrompt` is already on the object above; `get()` below serves it.
     webServer: {
       register(route) { return () => {}; },
     },
